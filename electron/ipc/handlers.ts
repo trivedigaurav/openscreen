@@ -470,6 +470,17 @@ export function registerIpcHandlers(
 
 	ipcMain.handle("save-exported-video", async (_, videoData: ArrayBuffer, fileName: string) => {
 		try {
+			// CLI export mode: skip save dialog, write directly
+			if (process.env.OPENSCREEN_EXPORT) {
+				const savePath = path.join(RECORDINGS_DIR, fileName);
+				await fs.writeFile(savePath, Buffer.from(videoData));
+				return {
+					success: true,
+					path: savePath,
+					message: "Video exported successfully",
+				};
+			}
+
 			// Determine file type from extension
 			const isGif = fileName.toLowerCase().endsWith(".gif");
 			const filters = isGif

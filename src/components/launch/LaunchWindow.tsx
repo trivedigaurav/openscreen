@@ -1,5 +1,5 @@
 import { ChevronDown, Languages } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { BsRecordCircle } from "react-icons/bs";
 import { FaRegStopCircle } from "react-icons/fa";
 import { FaFolderOpen } from "react-icons/fa6";
@@ -155,6 +155,35 @@ export function LaunchWindow() {
 		const interval = setInterval(checkSelectedSource, 500);
 		return () => clearInterval(interval);
 	}, []);
+
+	// CLI: auto-select source when main process sends it
+	const cliRecordingPending = useRef(false);
+	useEffect(() => {
+		if (!window.electronAPI?.onCliSelectSource) return;
+		const cleanup = window.electronAPI.onCliSelectSource(async (source) => {
+			await window.electronAPI.selectSource(source);
+			setSelectedSource(source.name);
+			setHasSelectedSource(true);
+		});
+		return cleanup;
+	}, []);
+
+	// CLI: auto-start recording when main process sends the signal
+	useEffect(() => {
+		if (!window.electronAPI?.onCliStartRecording) return;
+		const cleanup = window.electronAPI.onCliStartRecording(() => {
+			cliRecordingPending.current = true;
+		});
+		return cleanup;
+	}, []);
+
+	// CLI: trigger toggleRecording once source is selected and recording is pending
+	useEffect(() => {
+		if (cliRecordingPending.current && hasSelectedSource && !recording) {
+			cliRecordingPending.current = false;
+			toggleRecording();
+		}
+	}, [hasSelectedSource, recording, toggleRecording]);
 
 	const openSourceSelector = () => {
 		if (window.electronAPI) {

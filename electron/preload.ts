@@ -121,6 +121,30 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	setMicrophoneExpanded: (expanded: boolean) => {
 		ipcRenderer.send("hud:setMicrophoneExpanded", expanded);
 	},
+	onCliSelectSource: (callback: (source: unknown) => void) => {
+		const listener = (_: unknown, source: unknown) => callback(source);
+		ipcRenderer.on("cli-select-source", listener);
+		return () => ipcRenderer.removeListener("cli-select-source", listener);
+	},
+	onCliStartRecording: (callback: () => void) => {
+		const listener = () => callback();
+		ipcRenderer.on("cli-start-recording", listener);
+		return () => ipcRenderer.removeListener("cli-start-recording", listener);
+	},
+	notifyCliRecordingSaved: (videoPath: string) => {
+		ipcRenderer.send("cli-recording-saved", videoPath);
+	},
+	onCliExportProject: (
+		callback: (data: { project: unknown; outputPath: string | null }) => void,
+	) => {
+		const listener = (_: unknown, data: { project: unknown; outputPath: string | null }) =>
+			callback(data);
+		ipcRenderer.on("cli-export-project", listener);
+		return () => ipcRenderer.removeListener("cli-export-project", listener);
+	},
+	notifyCliExportDone: (result: { success: boolean; path?: string; error?: string }) => {
+		ipcRenderer.send("cli-export-done", result);
+	},
 	setHasUnsavedChanges: (hasChanges: boolean) => {
 		ipcRenderer.send("set-has-unsaved-changes", hasChanges);
 	},

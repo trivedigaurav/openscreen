@@ -137,6 +137,13 @@ interface Window {
 		setHasUnsavedChanges: (hasChanges: boolean) => void;
 		onRequestSaveBeforeClose: (callback: () => Promise<boolean> | boolean) => () => void;
 		setLocale: (locale: string) => Promise<void>;
+		onCliSelectSource: (callback: (source: ProcessedDesktopSource) => void) => () => void;
+		onCliStartRecording: (callback: () => void) => () => void;
+		notifyCliRecordingSaved: (videoPath: string) => void;
+		onCliExportProject: (
+			callback: (data: { project: unknown; outputPath: string | null }) => void,
+		) => () => void;
+		notifyCliExportDone: (result: { success: boolean; path?: string; error?: string }) => void;
 	};
 }
 

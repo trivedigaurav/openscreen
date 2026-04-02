@@ -1004,6 +1004,8 @@ export default function VideoEditor() {
 					},
 				},
 			});
+			// Notify CLI mode that export is complete
+			window.electronAPI.notifyCliExportDone?.({ success: true, path: filePath });
 		},
 		[handleShowExportedFile],
 	);
@@ -1200,6 +1202,18 @@ export default function VideoEditor() {
 						}
 					}
 
+					// Resolve wallpaper path for the exporter (preview uses getAssetPath
+					// but the exporter's FrameRenderer needs a fully-resolved URL)
+					let resolvedWallpaperForExport = wallpaper;
+					if (wallpaper.startsWith("/") && !wallpaper.startsWith("//")) {
+						try {
+							const { getAssetPath } = await import("@/lib/assetPath");
+							resolvedWallpaperForExport = await getAssetPath(wallpaper.replace(/^\//, ""));
+						} catch {
+							/* use as-is */
+						}
+					}
+
 					const exporter = new VideoExporter({
 						videoUrl: videoPath,
 						webcamVideoUrl: webcamVideoPath || undefined,
@@ -1208,7 +1222,7 @@ export default function VideoEditor() {
 						frameRate: 60,
 						bitrate,
 						codec: "avc1.640033",
-						wallpaper,
+						wallpaper: resolvedWallpaperForExport,
 						zoomRegions,
 						trimRegions,
 						speedRegions,
@@ -1354,6 +1368,35 @@ export default function VideoEditor() {
 		cropRegion,
 		handleExport,
 	]);
+
+	// CLI: auto-load project and export when triggered from main process
+	const cliExportPending = useRef(false);
+	useEffect(() => {
+		if (!window.electronAPI?.onCliExportProject) return;
+		const cleanup = window.electronAPI.onCliExportProject(async (data) => {
+			const restored = await applyLoadedProject(data.project, null);
+			if (!restored) {
+				window.electronAPI.notifyCliExportDone?.({
+					success: false,
+					error: "Failed to apply project data",
+				});
+				return;
+			}
+			cliExportPending.current = true;
+		});
+		return cleanup;
+	}, [applyLoadedProject]);
+
+	// CLI: trigger export once video is loaded after project apply
+	useEffect(() => {
+		if (!cliExportPending.current || !duration || duration <= 0) return;
+		cliExportPending.current = false;
+
+		const timer = setTimeout(() => {
+			handleExport({ format: exportFormat, quality: exportQuality });
+		}, 2000);
+		return () => clearTimeout(timer);
+	}, [duration, exportFormat, exportQuality, handleExport]);
 
 	const handleCancelExport = useCallback(() => {
 		if (exporterRef.current) {

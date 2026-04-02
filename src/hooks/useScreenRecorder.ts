@@ -247,6 +247,11 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 						await window.electronAPI.setCurrentVideoPath(result.path);
 					}
 
+					// Notify main process (for CLI mode)
+					if (result.path && window.electronAPI.notifyCliRecordingSaved) {
+						window.electronAPI.notifyCliRecordingSaved(result.path);
+					}
+
 					await window.electronAPI.switchToEditor();
 				} catch (error) {
 					console.error("Error saving recording:", error);

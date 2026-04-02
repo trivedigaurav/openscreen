@@ -1,9 +1,12 @@
+// Debug: write env and args to a file so we can verify what the process sees
+import { writeFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	app,
 	BrowserWindow,
+	desktopCapturer,
 	dialog,
 	ipcMain,
 	Menu,
@@ -12,9 +15,30 @@ import {
 	systemPreferences,
 	Tray,
 } from "electron";
+import { type CliArgs, parseCliArgs } from "./cli";
 import { mainT, setMainLocale } from "./i18n";
 import { registerIpcHandlers } from "./ipc/handlers";
 import { createEditorWindow, createHudOverlayWindow, createSourceSelectorWindow } from "./windows";
+
+try {
+	const debugInfo = {
+		argv: process.argv,
+		OPENSCREEN_LIST_SOURCES: process.env.OPENSCREEN_LIST_SOURCES ?? "(not set)",
+		OPENSCREEN_RECORD: process.env.OPENSCREEN_RECORD ?? "(not set)",
+		OPENSCREEN_SOURCE: process.env.OPENSCREEN_SOURCE ?? "(not set)",
+		pid: process.pid,
+		cwd: process.cwd(),
+	};
+	writeFileSync("/tmp/openscreen_cli_debug.json", JSON.stringify(debugInfo, null, 2));
+} catch {
+	/* ignore */
+}
+
+const cliArgs = parseCliArgs(process.argv);
+
+if (cliArgs.listSources || cliArgs.record) {
+	process.stderr.write(`CLI mode: listSources=${cliArgs.listSources} record=${cliArgs.record}\n`);
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -334,6 +358,208 @@ app.on("activate", () => {
 	}
 });
 
+// ── CLI: --list-sources ──────────────────────────────────────────────
+async function cliListSources() {
+	const sources = await desktopCapturer.getSources({
+		types: ["window", "screen"],
+		thumbnailSize: { width: 0, height: 0 },
+	});
+	const lines: string[] = ["\nAvailable sources:\n"];
+	for (const source of sources) {
+		const tag = source.id.startsWith("screen:") ? "[screen]" : "[window]";
+		lines.push(`  ${tag}  ${source.name}  (${source.id})`);
+	}
+	lines.push("");
+	const output = lines.join("\n");
+	// Packaged macOS apps don't reliably pipe stdout/stderr to the terminal,
+	// so write to both a file and stderr.
+	try {
+		await fs.writeFile("/tmp/openscreen_sources.txt", output);
+	} catch {
+		/* ignore */
+	}
+	process.stderr.write(output);
+	app.quit();
+}
+
+// Helper: log to both stderr and a status file (macOS apps don't reliably pipe to terminal)
+function cliLog(msg: string) {
+	process.stderr.write(msg + "\n");
+	fs.appendFile("/tmp/openscreen_cli_status.txt", msg + "\n").catch(() => {
+		// Best-effort logging — ignore write failures
+	});
+}
+
+// ── CLI: --record ────────────────────────────────────────────────────
+async function cliRecord(args: CliArgs) {
+	// 1. Pick the source
+	const sources = await desktopCapturer.getSources({
+		types: ["window", "screen"],
+		thumbnailSize: { width: 150, height: 150 },
+	});
+
+	let source = sources[0]; // default: first source (usually entire screen)
+	if (args.sourcePattern) {
+		const pattern = args.sourcePattern.toLowerCase();
+		const match = sources.find((s) => s.name.toLowerCase().includes(pattern));
+		if (!match) {
+			console.error(`No source matching "${args.sourcePattern}". Available sources:`);
+			for (const s of sources) {
+				console.error(`  ${s.name} (${s.id})`);
+			}
+			app.quit();
+			return;
+		}
+		source = match;
+	}
+
+	cliLog(`CLI: Recording source "${source.name}" (${source.id})`);
+
+	// 2. Pre-select the source so getSelectedSource() returns it in the renderer
+	ipcMain.handle("get-selected-source-cli-override", () => ({
+		id: source.id,
+		name: source.name,
+		display_id: source.display_id,
+		thumbnail: source.thumbnail?.toDataURL() ?? null,
+		appIcon: source.appIcon?.toDataURL() ?? null,
+	}));
+
+	// 3. Create the HUD overlay window — it loads the renderer which does the actual recording
+	createWindow();
+	if (!mainWindow) {
+		console.error("CLI: Failed to create window");
+		app.quit();
+		return;
+	}
+
+	// 4. Once the renderer finishes loading, auto-select source + auto-start recording
+	mainWindow.webContents.on("did-finish-load", () => {
+		if (!mainWindow || mainWindow.isDestroyed()) return;
+
+		// Give the React app a moment to mount, then trigger recording
+		setTimeout(() => {
+			if (!mainWindow || mainWindow.isDestroyed()) return;
+
+			// Tell renderer to select the source and start recording
+			mainWindow.webContents.send("cli-select-source", {
+				id: source.id,
+				name: source.name,
+				display_id: source.display_id,
+				thumbnail: source.thumbnail?.toDataURL() ?? null,
+				appIcon: source.appIcon?.toDataURL() ?? null,
+			});
+
+			setTimeout(() => {
+				if (!mainWindow || mainWindow.isDestroyed()) return;
+				mainWindow.webContents.send("cli-start-recording");
+				cliLog("CLI: Recording started");
+
+				// Duration-based auto-stop
+				if (args.duration) {
+					cliLog(`CLI: Will stop after ${args.duration} seconds`);
+					setTimeout(() => {
+						if (mainWindow && !mainWindow.isDestroyed()) {
+							cliLog("CLI: Duration reached, stopping...");
+							mainWindow.webContents.send("stop-recording-from-tray");
+						}
+					}, args.duration * 1000);
+				}
+			}, 1500);
+		}, 2000);
+	});
+
+	// 5. Handle SIGINT for graceful stop
+	process.on("SIGINT", () => {
+		cliLog("CLI: Stopping recording (SIGINT)...");
+		if (mainWindow && !mainWindow.isDestroyed()) {
+			mainWindow.webContents.send("stop-recording-from-tray");
+			// Give time for recording to finalize before quitting
+			setTimeout(() => app.quit(), 5000);
+		} else {
+			app.quit();
+		}
+	});
+
+	// 6. Listen for recording-saved event to copy output and quit
+	ipcMain.on("cli-recording-saved", async (_, videoPath: string) => {
+		cliLog(`CLI: Recording saved to ${videoPath}`);
+		if (args.outputPath) {
+			try {
+				await fs.copyFile(videoPath, args.outputPath);
+				cliLog(`CLI: Copied to ${args.outputPath}`);
+			} catch (err) {
+				console.error(`CLI: Failed to copy to ${args.outputPath}:`, err);
+			}
+		}
+		setTimeout(() => app.quit(), 1000);
+	});
+}
+
+// ── CLI: export project ──────────────────────────────────────────────
+async function cliExport(args: CliArgs) {
+	if (!args.exportProject) return;
+
+	// Read and validate the project file
+	let projectJson: string;
+	try {
+		projectJson = (await fs.readFile(args.exportProject, "utf-8")).toString();
+	} catch {
+		cliLog(`CLI: Failed to read project file: ${args.exportProject}`);
+		app.quit();
+		return;
+	}
+
+	let project: unknown;
+	try {
+		project = JSON.parse(projectJson);
+	} catch {
+		cliLog("CLI: Invalid JSON in project file");
+		app.quit();
+		return;
+	}
+
+	cliLog(`CLI: Exporting project ${args.exportProject}`);
+
+	// Open the editor window (not HUD)
+	const editorWin = createEditorWindow();
+	mainWindow = editorWin;
+
+	editorWin.webContents.on("did-finish-load", () => {
+		// Give React time to mount
+		setTimeout(() => {
+			if (editorWin.isDestroyed()) return;
+
+			// Send the project data and output path to the renderer for auto-export
+			editorWin.webContents.send("cli-export-project", {
+				project,
+				outputPath: args.outputPath,
+			});
+			cliLog("CLI: Sent export request to editor");
+		}, 3000);
+	});
+
+	// Listen for export completion
+	ipcMain.on(
+		"cli-export-done",
+		async (_, result: { success: boolean; path?: string; error?: string }) => {
+			if (result.success) {
+				cliLog(`CLI: Export complete: ${result.path}`);
+				if (args.outputPath && result.path) {
+					try {
+						await fs.copyFile(result.path, args.outputPath);
+						cliLog(`CLI: Copied to ${args.outputPath}`);
+					} catch (err) {
+						cliLog(`CLI: Failed to copy: ${err}`);
+					}
+				}
+			} else {
+				cliLog(`CLI: Export failed: ${result.error}`);
+			}
+			setTimeout(() => app.quit(), 1000);
+		},
+	);
+}
+
 // Register all IPC handlers when app is ready
 app.whenReady().then(async () => {
 	// Allow microphone/media permission checks
@@ -385,5 +611,15 @@ app.whenReady().then(async () => {
 			}
 		},
 	);
-	createWindow();
+
+	// ── CLI mode or GUI mode ─────────────────────────────────────────
+	if (cliArgs.listSources) {
+		await cliListSources();
+	} else if (cliArgs.record) {
+		await cliRecord(cliArgs);
+	} else if (cliArgs.exportProject) {
+		await cliExport(cliArgs);
+	} else {
+		createWindow();
+	}
 });
