@@ -436,59 +436,114 @@ async function cliRecord(args: CliArgs) {
 	mainWindow.webContents.on("did-finish-load", () => {
 		if (!mainWindow || mainWindow.isDestroyed()) return;
 
-		// Give the React app a moment to mount, then trigger recording
-		setTimeout(() => {
-			if (!mainWindow || mainWindow.isDestroyed()) return;
+		// Wait for React to mount, then programmatically click the record button
+		const startRecordingWithRetry = (attemptsLeft: number) => {
+			if (!mainWindow || mainWindow.isDestroyed() || attemptsLeft <= 0) {
+				cliLog("CLI: Failed to start recording after retries");
+				return;
+			}
 
-			// Tell renderer to select the source and start recording
-			mainWindow.webContents.send("cli-select-source", {
-				id: source.id,
-				name: source.name,
-				display_id: source.display_id,
-				thumbnail: source.thumbnail?.toDataURL() ?? null,
-				appIcon: source.appIcon?.toDataURL() ?? null,
-			});
+			mainWindow.webContents
+				.executeJavaScript(`
+					(async () => {
+						// Select the source via electronAPI
+						await window.electronAPI.selectSource(${JSON.stringify({
+							id: source.id,
+							name: source.name,
+							display_id: source.display_id,
+							thumbnail: source.thumbnail?.toDataURL() ?? null,
+							appIcon: source.appIcon?.toDataURL() ?? null,
+						})});
 
-			setTimeout(() => {
-				if (!mainWindow || mainWindow.isDestroyed()) return;
-				mainWindow.webContents.send("cli-start-recording");
-				cliLog("CLI: Recording started");
+						// Wait for the UI to pick up the source (it polls every 500ms)
+						await new Promise(r => setTimeout(r, 1000));
 
-				// Duration-based auto-stop
-				if (args.duration) {
-					cliLog(`CLI: Will stop after ${args.duration} seconds`);
-					setTimeout(() => {
-						if (mainWindow && !mainWindow.isDestroyed()) {
-							cliLog("CLI: Duration reached, stopping...");
-							mainWindow.webContents.send("stop-recording-from-tray");
+						// Set CLI mode flag
+						window.__cliRecordMode = true;
+
+						// Find and click the record button
+						const btn = document.querySelector('[data-record-btn]');
+						if (btn && !btn.disabled) {
+							btn.click();
+							return 'clicked';
 						}
-					}, args.duration * 1000);
-				}
-			}, 1500);
-		}, 2000);
+						if (btn && btn.disabled) return 'disabled';
+						return 'not-found';
+					})()
+				`)
+				.then((result: string) => {
+					if (result === "clicked") {
+						cliLog("CLI: Record button clicked");
+					} else {
+						cliLog(`CLI: Record button not found, retrying... (${attemptsLeft - 1} left)`);
+						setTimeout(() => startRecordingWithRetry(attemptsLeft - 1), 1000);
+					}
+				})
+				.catch(() => {
+					setTimeout(() => startRecordingWithRetry(attemptsLeft - 1), 1000);
+				});
+		};
+
+		// Start trying after 3 seconds (for React mount)
+		setTimeout(() => startRecordingWithRetry(10), 3000);
 	});
 
-	// 5. Handle SIGINT for graceful stop
+	// 5. Poll for stop signal file (SIGINT doesn't work reliably on macOS packaged apps)
+	const stopSignalFile = "/tmp/openscreen_stop";
+	const pollInterval = setInterval(async () => {
+		try {
+			await fs.access(stopSignalFile);
+			// Stop signal found — stop recording
+			clearInterval(pollInterval);
+			await fs.unlink(stopSignalFile).catch(() => {
+				// ignore
+			});
+			cliLog("CLI: Stop signal received, clicking stop button...");
+			if (mainWindow && !mainWindow.isDestroyed()) {
+				mainWindow.webContents
+					.executeJavaScript(`
+						(() => {
+							const btn = document.querySelector('[data-record-btn]');
+							if (btn) { btn.click(); return 'stopped'; }
+							return 'not-found';
+						})()
+					`)
+					.then((r: string) => cliLog(`CLI: Stop result: ${r}`))
+					.catch(() => cliLog("CLI: Stop click failed"));
+				// Safety: quit after 25s if recording-saved never fires
+				setTimeout(() => {
+					cliLog("CLI: Save timeout — quitting");
+					app.quit();
+				}, 25000);
+			}
+		} catch {
+			// File doesn't exist yet — keep polling
+		}
+	}, 500);
+
+	// Also handle SIGINT as backup
 	process.on("SIGINT", () => {
+		clearInterval(pollInterval);
 		cliLog("CLI: Stopping recording (SIGINT)...");
 		if (mainWindow && !mainWindow.isDestroyed()) {
 			mainWindow.webContents.send("stop-recording-from-tray");
-			// Give time for recording to finalize before quitting
-			setTimeout(() => app.quit(), 5000);
-		} else {
-			app.quit();
 		}
 	});
 
 	// 6. Listen for recording-saved event to copy output and quit
 	ipcMain.on("cli-recording-saved", async (_, videoPath: string) => {
-		cliLog(`CLI: Recording saved to ${videoPath}`);
+		cliLog(`CLI: Recording result: ${videoPath}`);
+		if (videoPath.startsWith("error:")) {
+			cliLog(`CLI: Recording failed — ${videoPath}`);
+			setTimeout(() => app.quit(), 1000);
+			return;
+		}
 		if (args.outputPath) {
 			try {
 				await fs.copyFile(videoPath, args.outputPath);
 				cliLog(`CLI: Copied to ${args.outputPath}`);
 			} catch (err) {
-				console.error(`CLI: Failed to copy to ${args.outputPath}:`, err);
+				cliLog(`CLI: Failed to copy: ${err}`);
 			}
 		}
 		setTimeout(() => app.quit(), 1000);
@@ -519,6 +574,15 @@ async function cliExport(args: CliArgs) {
 	}
 
 	cliLog(`CLI: Exporting project ${args.exportProject}`);
+
+	// Clear any stale recording session so the editor doesn't load an old video
+	ipcMain.handle("get-current-recording-session-cli-cleared", () => ({ success: false }));
+	ipcMain.removeHandler("get-current-recording-session");
+	ipcMain.handle("get-current-recording-session", () => ({ success: false }));
+	ipcMain.removeHandler("get-current-video-path");
+	ipcMain.handle("get-current-video-path", () => ({ success: false }));
+	ipcMain.removeHandler("load-current-project-file");
+	ipcMain.handle("load-current-project-file", () => ({ success: false }));
 
 	// Open the editor window (not HUD)
 	const editorWin = createEditorWindow();

@@ -202,12 +202,15 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			window.electronAPI?.setRecordingState(false);
 
 			void (async () => {
+				const isCli = (window as { __cliRecordMode?: boolean }).__cliRecordMode;
 				try {
 					const screenBlob = await activeScreenRecorder.recordedBlobPromise;
 					if (discardRecordingId.current === activeRecordingId) {
+						if (isCli) window.electronAPI.notifyCliRecordingSaved("error:discarded");
 						return;
 					}
 					if (screenBlob.size === 0) {
+						if (isCli) window.electronAPI.notifyCliRecordingSaved("error:empty-blob");
 						return;
 					}
 
@@ -237,7 +240,8 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 					});
 
 					if (!result.success) {
-						console.error("Failed to store recording session:", result.message);
+						if (isCli)
+							window.electronAPI.notifyCliRecordingSaved(`error:store-failed:${result.message}`);
 						return;
 					}
 
@@ -247,13 +251,15 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 						await window.electronAPI.setCurrentVideoPath(result.path);
 					}
 
-					// Notify main process (for CLI mode)
-					if (result.path && window.electronAPI.notifyCliRecordingSaved) {
+					// CLI mode — notify and don't switch to editor
+					if (isCli && result.path) {
 						window.electronAPI.notifyCliRecordingSaved(result.path);
+						return;
 					}
 
 					await window.electronAPI.switchToEditor();
 				} catch (error) {
+					if (isCli) window.electronAPI.notifyCliRecordingSaved(`error:exception:${String(error)}`);
 					console.error("Error saving recording:", error);
 				} finally {
 					if (finalizingRecordingId.current === activeRecordingId) {
@@ -342,6 +348,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		try {
 			const selectedSource = await window.electronAPI.getSelectedSource();
 			if (!selectedSource) {
+				if ((window as { __cliRecordMode?: boolean }).__cliRecordMode) {
+					window.electronAPI.notifyCliRecordingSaved("error:no-source-selected");
+				}
 				alert(t("recording.selectSource"));
 				return;
 			}
@@ -539,8 +548,12 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				);
 			}
 		} catch (error) {
-			console.error("Failed to start recording:", error);
 			const errorMsg = error instanceof Error ? error.message : "Failed to start recording";
+			// Report to CLI mode (console.error is stripped by terser in production)
+			if ((window as { __cliRecordMode?: boolean }).__cliRecordMode) {
+				window.electronAPI.notifyCliRecordingSaved(`error:start-failed:${errorMsg}`);
+			}
+			console.error("Failed to start recording:", error);
 			if (errorMsg.includes("Permission denied") || errorMsg.includes("NotAllowedError")) {
 				toast.error(t("recording.permissionDenied"));
 			} else {

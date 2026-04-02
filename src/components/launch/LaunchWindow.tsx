@@ -172,6 +172,7 @@ export function LaunchWindow() {
 	useEffect(() => {
 		if (!window.electronAPI?.onCliStartRecording) return;
 		const cleanup = window.electronAPI.onCliStartRecording(() => {
+			(window as { __cliRecordMode?: boolean }).__cliRecordMode = true;
 			cliRecordingPending.current = true;
 		});
 		return cleanup;
@@ -337,6 +338,7 @@ export function LaunchWindow() {
 
 					{/* Record/Stop group */}
 					<button
+						data-record-btn
 						className={`flex items-center gap-0.5 rounded-full p-2 transition-colors duration-150 ${styles.electronNoDrag} ${
 							recording ? "animate-record-pulse bg-red-500/10" : "bg-white/5 hover:bg-white/[0.08]"
 						}`}

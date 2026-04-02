@@ -1369,7 +1369,22 @@ export default function VideoEditor() {
 		handleExport,
 	]);
 
+	// (CLI export effects are placed before the error/loading early returns below)
+
+	const handleCancelExport = useCallback(() => {
+		if (exporterRef.current) {
+			exporterRef.current.cancel();
+			toast.info("Export canceled");
+			setShowExportDialog(false);
+			setIsExporting(false);
+			setExportProgress(null);
+			setExportError(null);
+			setExportedFilePath(null);
+		}
+	}, []);
+
 	// CLI: auto-load project and export when triggered from main process
+	// These hooks MUST be before the loading/error early returns so they always run.
 	const cliExportPending = useRef(false);
 	useEffect(() => {
 		if (!window.electronAPI?.onCliExportProject) return;
@@ -1397,18 +1412,6 @@ export default function VideoEditor() {
 		}, 2000);
 		return () => clearTimeout(timer);
 	}, [duration, exportFormat, exportQuality, handleExport]);
-
-	const handleCancelExport = useCallback(() => {
-		if (exporterRef.current) {
-			exporterRef.current.cancel();
-			toast.info("Export canceled");
-			setShowExportDialog(false);
-			setIsExporting(false);
-			setExportProgress(null);
-			setExportError(null);
-			setExportedFilePath(null);
-		}
-	}, []);
 
 	if (loading) {
 		return (
